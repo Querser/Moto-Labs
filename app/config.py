@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Moto Laps"
-    app_version: str = "0.8.0"
+    app_version: str = "0.9.0"
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"

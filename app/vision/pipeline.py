@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 
@@ -139,7 +140,7 @@ class MotorcycleVisionPipeline:
         passage_guard: ParticipantPassageGuard | None = None,
         pending_crossing_ns: int = 4_000_000_000,
         recovery_delay_ns: int = 0,
-        evidence_limit: int = 20,
+        evidence_limit: int = 28,
         number_verifier: NumberVerifier | None = None,
         recover_identities_on_exit: bool = True,
     ) -> None:
@@ -164,6 +165,8 @@ class MotorcycleVisionPipeline:
         self._recovery_diagnostics: dict[int, tuple[dict[str, Any], ...]] = {}
         self._identity_recovered_tracks: set[int] = set()
         self._last_observed_tracks: tuple[Track, ...] = ()
+        self._track_aliases: dict[int, int] = {}
+        self._recent_track_snapshots: dict[int, Track] = {}
 
     @property
     def finish_line(self) -> FinishLine:
@@ -181,6 +184,20 @@ class MotorcycleVisionPipeline:
         self._recovery_attempts_by_track.clear()
         self.passage_guard.reset()
 
+    def track_near_finish_line(
+        self,
+        frame_size: tuple[int, int],
+        *,
+        margin: float = 0.06,
+    ) -> bool:
+        """Return whether a recently observed motorcycle is entering the line band."""
+
+        width, height = frame_size
+        return any(
+            _normalized_bbox_near_line(track.bbox, width, height, self.finish_line, margin)
+            for track in self._last_observed_tracks
+        )
+
     def reset(self) -> None:
         self.tracker.reset()
         self.ocr_aggregator.reset()
@@ -195,6 +212,8 @@ class MotorcycleVisionPipeline:
         self._recovery_diagnostics.clear()
         self._identity_recovered_tracks.clear()
         self._last_observed_tracks = ()
+        self._track_aliases.clear()
+        self._recent_track_snapshots.clear()
 
     def close(self) -> None:
         self.detector.close()
@@ -222,8 +241,13 @@ class MotorcycleVisionPipeline:
 
     def process(self, frame: Frame) -> VisionPipelineResult:
         detections = self.detector.detect(frame)
-        tracks = tuple(
-            self.tracker.update(detections, captured_monotonic_ns=frame.captured_monotonic_ns)
+        tracks = self._stitch_tracklets(
+            tuple(
+                self.tracker.update(
+                    detections,
+                    captured_monotonic_ns=frame.captured_monotonic_ns,
+                )
+            )
         )
         self._last_observed_tracks = tuple(track for track in tracks if track.observed)
         frame_size = _frame_size(frame)
@@ -389,6 +413,81 @@ class MotorcycleVisionPipeline:
             tuple(digit_regions),
         )
 
+    def _stitch_tracklets(self, tracks: tuple[Track, ...]) -> tuple[Track, ...]:
+        """Keep one logical ID across a short, spatially plausible tracker split.
+
+        Tiny distant motorcycles are sometimes absent for a few detector frames.
+        ByteTrack then creates a new raw ID even though the physical motorcycle
+        continued smoothly. A conservative one-to-one handoff preserves the OCR
+        burst; ambiguous close-together riders deliberately remain separate.
+        """
+
+        if not tracks:
+            return ()
+        now_ns = max(track.captured_monotonic_ns for track in tracks)
+        current_raw_ids = {track.track_id for track in tracks}
+        observed_canonical_ids = {
+            self._track_aliases.get(track.track_id, track.track_id) for track in tracks
+        }
+        stitched: list[Track] = []
+        claimed_canonical_ids: set[int] = set()
+        for raw_track in sorted(tracks, key=lambda item: item.confidence, reverse=True):
+            raw_id = raw_track.track_id
+            canonical_id = self._track_aliases.get(raw_id)
+            previous: Track | None = None
+            if canonical_id is None:
+                candidates: list[tuple[float, int, Track]] = []
+                for candidate_id, candidate in self._recent_track_snapshots.items():
+                    if (
+                        candidate_id in observed_canonical_ids
+                        or candidate_id in claimed_canonical_ids
+                    ):
+                        continue
+                    if candidate_id in current_raw_ids:
+                        continue
+                    score = _tracklet_handoff_score(candidate, raw_track)
+                    if score is not None:
+                        candidates.append((score, candidate_id, candidate))
+                candidates.sort(key=lambda item: item[0])
+                unambiguous = (
+                    candidates
+                    and (
+                        len(candidates) == 1
+                        or candidates[1][0] - candidates[0][0] >= 0.16
+                    )
+                )
+                if unambiguous:
+                    _score, canonical_id, previous = candidates[0]
+                else:
+                    canonical_id = raw_id
+                self._track_aliases[raw_id] = canonical_id
+            elif canonical_id != raw_id:
+                previous = self._recent_track_snapshots.get(canonical_id)
+            claimed_canonical_ids.add(canonical_id)
+            raw_metadata = {**raw_track.metadata, "raw_track_id": raw_id}
+            if canonical_id == raw_id:
+                logical = replace(raw_track, metadata=raw_metadata)
+            else:
+                logical = replace(
+                    raw_track,
+                    track_id=canonical_id,
+                    hits=(previous.hits if previous is not None else 0) + raw_track.hits,
+                    age=(previous.age if previous is not None else 0) + raw_track.age,
+                    metadata=raw_metadata,
+                )
+            stitched.append(logical)
+        by_canonical: dict[int, Track] = {}
+        for track in stitched:
+            existing = by_canonical.get(track.track_id)
+            if existing is None or track.confidence > existing.confidence:
+                by_canonical[track.track_id] = track
+        for track in by_canonical.values():
+            self._recent_track_snapshots[track.track_id] = track
+        for track_id, snapshot in tuple(self._recent_track_snapshots.items()):
+            if now_ns - snapshot.captured_monotonic_ns > 1_000_000_000:
+                self._recent_track_snapshots.pop(track_id, None)
+        return tuple(sorted(by_canonical.values(), key=lambda item: item.track_id))
+
     def collect_evidence(self, frame: Frame) -> None:
         """Retain an in-between source frame without another detector pass.
 
@@ -530,12 +629,36 @@ class MotorcycleVisionPipeline:
             key=lambda item: item.quality,
             reverse=True,
         )[:6]
-        retained[:] = (localized + fallbacks + anchored)[: self.evidence_limit]
+        # A logical motorcycle can span several raw ByteTrack IDs. Preserve a
+        # couple of sharp crops from each recent fragment so the handoff does
+        # not let early distant frames crowd out the close number-board view.
+        by_raw_track: defaultdict[int, list[_OcrEvidence]] = defaultdict(list)
+        for item in retained:
+            by_raw_track[int(item.track.metadata.get("raw_track_id", item.track.track_id))].append(
+                item
+            )
+        recent_segments = sorted(
+            by_raw_track.values(),
+            key=lambda values: max(item.frame.sequence for item in values),
+            reverse=True,
+        )[:4]
+        segment_representatives = [
+            item
+            for values in recent_segments
+            for item in sorted(values, key=lambda value: value.quality, reverse=True)[:2]
+        ]
+        retained[:] = _unique_evidence(
+            segment_representatives + localized + fallbacks + anchored,
+            limit=self.evidence_limit,
+        )
 
     def _recover_track_number(self, track_id: int) -> _RecoveredNumber | None:
         """Resolve a fast pass from the best distinct frames captured earlier."""
 
-        evidence = self._evidence_by_track.pop(track_id, [])
+        # Keep an unresolved burst for the second post-line attempt. Earlier
+        # versions popped it before OCR, so a clipped pre-line ``43`` could
+        # never be combined with the later ``35`` from the same motorcycle.
+        evidence = list(self._evidence_by_track.get(track_id, []))
         if not evidence:
             return None
         # Preserve candidate diversity, but cap expensive OCR work. Several
@@ -563,6 +686,25 @@ class MotorcycleVisionPipeline:
             if len(anchored) >= 3:
                 break
         selected = localized + fallbacks + anchored
+        by_raw_track: defaultdict[int, list[_OcrEvidence]] = defaultdict(list)
+        for item in evidence:
+            by_raw_track[int(item.track.metadata.get("raw_track_id", item.track.track_id))].append(
+                item
+            )
+        recent_segments = sorted(
+            by_raw_track.values(),
+            key=lambda values: max(item.frame.sequence for item in values),
+            reverse=True,
+        )[:2]
+        segment_representatives = [
+            item
+            for values in recent_segments
+            for item in _select_segment_families(values)
+        ]
+        selected = _unique_evidence(
+            segment_representatives + selected,
+            limit=16,
+        )
         # Most retained crops use the 256-pixel text detector with no repeated
         # preprocessing. One best crop per candidate family receives the
         # 480-pixel pass; only the overall best gets one alternate preprocessing
@@ -573,6 +715,7 @@ class MotorcycleVisionPipeline:
             for group in (localized, fallbacks, anchored)
             if group
         }
+        high_resolution_ids.update(id(item) for item in segment_representatives)
         v5_recovery_ids: set[int] = set()
         v5_frame_sequences: set[int] = set()
         direction_ready_fallbacks = sorted(
@@ -587,6 +730,16 @@ class MotorcycleVisionPipeline:
             v5_frame_sequences.add(item.frame.sequence)
             if len(v5_recovery_ids) >= 3:
                 break
+        # One localized crop from each of the last two raw tracker fragments
+        # receives the alternate recognizer. This is the bounded path that can
+        # pair a pre-handoff partial reading with a post-handoff partial.
+        for item in segment_representatives:
+            if (
+                "_anchor_" in item.region.kind
+                or item.region.kind == "front_board_fallback"
+            ):
+                continue
+            v5_recovery_ids.add(id(item))
         # PP-OCRv6 receives only a small, temporally diverse subset. This keeps
         # uploaded-video throughput high while giving ambiguous boards the
         # strongest available local recognizer.
@@ -656,6 +809,12 @@ class MotorcycleVisionPipeline:
                 votes[text].append((prediction.confidence, quality, frame_sequence))
         if not votes:
             return None
+        temporally_stitched_texts = _add_temporal_overlap_candidates(
+            votes,
+            engines_by_text,
+            whole_board_texts,
+            localized_texts,
+        )
         ranked: list[tuple[str, float, int, float, float, int]] = []
         for text, values in votes.items():
             weighted = sum(
@@ -688,6 +847,7 @@ class MotorcycleVisionPipeline:
                 "engines": item[5],
                 "whole_board": item[0] in whole_board_texts,
                 "text_localized": item[0] in localized_texts,
+                "temporal_stitch": item[0] in temporally_stitched_texts,
             }
             for item in ranked
         )
@@ -762,6 +922,18 @@ class MotorcycleVisionPipeline:
                     and maximum_confidence >= 0.94
                     and score - runner_score >= 0.60
                 )
+                or (
+                    count >= 2
+                    and maximum_confidence >= 0.95
+                    and score - runner_score >= 0.50
+                    and not has_truncation_conflict
+                )
+                or (
+                    text in temporally_stitched_texts
+                    and count >= 2
+                    and maximum_confidence >= 0.85
+                    and score - runner_score >= 0.20
+                )
             )
         ) or truncated_confirmation
         pristine_single = maximum_confidence >= (
@@ -811,10 +983,6 @@ class MotorcycleVisionPipeline:
                 allowed_candidates = tuple(
                     item[0] for item in verification_candidates[:4]
                 )
-                # One strongest retained crop is enough for a conservative
-                # tie-break. Re-running an autoregressive VLM once per OCR
-                # candidate multiplied the latency while looking at almost
-                # identical images and did not add independent evidence.
                 candidate_image = max(
                     (
                         candidate_images[item]
@@ -853,17 +1021,21 @@ class MotorcycleVisionPipeline:
                         and verified[2] >= 2
                         and verified[1] >= ranked[0][1] * 0.80
                     ):
-                        return _RecoveredNumber(
+                        result = _RecoveredNumber(
                             verification.racing_number,
                             min(0.88, max(verification.confidence, verified[3] * 0.80)),
                             verified[2],
                         )
+                        self._evidence_by_track.pop(track_id, None)
+                        return result
             return None
         confidence = min(
             0.98,
             maximum_confidence if count == 1 else 0.70 + 0.08 * min(count, 3),
         )
-        return _RecoveredNumber(text, confidence, count)
+        result = _RecoveredNumber(text, confidence, count)
+        self._evidence_by_track.pop(track_id, None)
+        return result
 
     def _age_track_state(
         self,
@@ -919,10 +1091,111 @@ class MotorcycleVisionPipeline:
         return tuple(recovered_identities)
 
 
+def _add_temporal_overlap_candidates(
+    votes: dict[str, list[tuple[float, float, int]]],
+    engines_by_text: dict[str, set[str]],
+    whole_board_texts: set[str],
+    localized_texts: set[str],
+) -> set[str]:
+    """Reconstruct a number clipped differently in nearby source frames.
+
+    For example, a left-clipped/right-clipped passage can yield ``43`` and
+    ``35``. Their ordered overlap supplies independent evidence for ``435``.
+    No roster or expected-number list participates in this operation.
+    """
+
+    stitched: set[str] = set()
+    originals = list(votes.items())
+    for left_text, left_values in originals:
+        if len(left_text) < 2:
+            continue
+        for right_text, right_values in originals:
+            if left_text == right_text or len(right_text) < 2:
+                continue
+            overlap = next(
+                (
+                    size
+                    for size in range(min(len(left_text), len(right_text)), 0, -1)
+                    if left_text[-size:] == right_text[:size]
+                ),
+                0,
+            )
+            if overlap == 0:
+                continue
+            merged = left_text + right_text[overlap:]
+            if not 3 <= len(merged) <= 4 or merged in {left_text, right_text}:
+                continue
+            compatible_pairs = [
+                (left, right)
+                for left in left_values
+                for right in right_values
+                if 0 < right[2] - left[2] <= 45
+                and left[0] >= 0.68
+                and right[0] >= 0.68
+            ]
+            if not compatible_pairs:
+                continue
+            left, right = max(
+                compatible_pairs,
+                key=lambda pair: pair[0][0] * pair[0][1] + pair[1][0] * pair[1][1],
+            )
+            combined = {value[2]: value for value in votes.get(merged, [])}
+            combined[left[2]] = left
+            combined[right[2]] = right
+            votes[merged] = list(combined.values())
+            engines_by_text.setdefault(merged, set()).update(
+                engines_by_text.get(left_text, set())
+                | engines_by_text.get(right_text, set())
+            )
+            if left_text in whole_board_texts or right_text in whole_board_texts:
+                whole_board_texts.add(merged)
+            if left_text in localized_texts or right_text in localized_texts:
+                localized_texts.add(merged)
+            stitched.add(merged)
+    return stitched
+
+
 def _candidate_quality(region: CandidateRegion) -> float:
     """Rank crop sharpness, useful pixel size, and localization confidence."""
 
     return measure_region_quality(region).score
+
+
+def _tracklet_handoff_score(previous: Track, current: Track) -> float | None:
+    """Score a conservative short-gap handoff; lower values are better."""
+
+    gap_ns = current.captured_monotonic_ns - previous.captured_monotonic_ns
+    if not 0 < gap_ns <= 350_000_000:
+        return None
+    vertical_overlap = max(
+        0.0,
+        min(previous.bbox.y2, current.bbox.y2)
+        - max(previous.bbox.y1, current.bbox.y1),
+    )
+    overlap_ratio = vertical_overlap / max(
+        1.0,
+        min(previous.bbox.height, current.bbox.height),
+    )
+    if overlap_ratio < 0.45:
+        return None
+    area_ratio = current.bbox.area / max(1.0, previous.bbox.area)
+    if not 0.22 <= area_ratio <= 4.5:
+        return None
+    center_distance = previous.bbox.centroid_distance(current.bbox)
+    scale = max(
+        1.0,
+        math.hypot(previous.bbox.width, previous.bbox.height),
+        math.hypot(current.bbox.width, current.bbox.height),
+    )
+    normalized_distance = center_distance / scale
+    if normalized_distance > 0.82:
+        return None
+    return (
+        normalized_distance
+        + (gap_ns / 350_000_000) * 0.20
+        + abs(math.log(area_ratio)) * 0.12
+        + (1.0 - overlap_ratio) * 0.18
+    )
 
 
 def _select_diverse_localized_evidence(
@@ -969,6 +1242,52 @@ def _select_diverse_localized_evidence(
     return selected[:limit]
 
 
+def _unique_evidence(
+    evidence: list[_OcrEvidence],
+    *,
+    limit: int,
+) -> list[_OcrEvidence]:
+    """Keep insertion order while removing the same retained crop object."""
+
+    result: list[_OcrEvidence] = []
+    seen: set[int] = set()
+    for item in evidence:
+        marker = id(item)
+        if marker in seen:
+            continue
+        result.append(item)
+        seen.add(marker)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _select_segment_families(evidence: list[_OcrEvidence]) -> list[_OcrEvidence]:
+    """Keep localized, contextual, and anchored views of one raw tracklet."""
+
+    localized = max(
+        (
+            item
+            for item in evidence
+            if "_anchor_" not in item.region.kind
+            and item.region.kind != "front_board_fallback"
+        ),
+        key=lambda item: item.quality,
+        default=None,
+    )
+    fallback = max(
+        (item for item in evidence if item.region.kind == "front_board_fallback"),
+        key=lambda item: item.quality,
+        default=None,
+    )
+    anchor = max(
+        (item for item in evidence if "_anchor_" in item.region.kind),
+        key=lambda item: item.quality,
+        default=None,
+    )
+    return [item for item in (localized, fallback, anchor) if item is not None]
+
+
 def _extrapolate_track(track: Track, captured_monotonic_ns: int) -> Track:
     """Move the latest bbox by its recent centroid velocity for one skipped frame."""
 
@@ -1004,6 +1323,36 @@ def _frame_size(frame: Frame) -> tuple[int, int]:
     if configured:
         return int(configured[0]), int(configured[1])
     return 1280, 720
+
+
+def _normalized_bbox_near_line(
+    bbox: BoundingBox,
+    width: int,
+    height: int,
+    line: FinishLine,
+    margin: float,
+) -> bool:
+    """Test a normalized bbox against a finite-width band around the line."""
+
+    center_x = (bbox.x1 + bbox.x2) / (2 * max(1, width))
+    center_y = (bbox.y1 + bbox.y2) / (2 * max(1, height))
+    half_diagonal = math.hypot(
+        bbox.width / (2 * max(1, width)),
+        bbox.height / (2 * max(1, height)),
+    )
+    line_dx = line.x2 - line.x1
+    line_dy = line.y2 - line.y1
+    line_length = max(1e-9, math.hypot(line_dx, line_dy))
+    distance = abs(
+        line_dy * center_x
+        - line_dx * center_y
+        + line.x2 * line.y1
+        - line.y2 * line.x1
+    ) / line_length
+    projection = (
+        (center_x - line.x1) * line_dx + (center_y - line.y1) * line_dy
+    ) / (line_length * line_length)
+    return -0.15 <= projection <= 1.15 and distance <= half_diagonal + margin
 
 
 def _digit_region(

@@ -44,7 +44,11 @@ from .types import (
     Track,
     TrajectoryPoint,
 )
-from .verifier import Florence2NumberVerifier, NumberVerification, NumberVerifier
+from .verifier import (
+    Florence2NumberVerifier,
+    NumberVerification,
+    NumberVerifier,
+)
 
 __all__ = [
     "BoundingBox",

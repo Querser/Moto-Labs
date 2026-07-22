@@ -20,7 +20,6 @@ import cv2
 from app.camera import Frame
 from app.vision import (
     FinishLine,
-    Florence2NumberVerifier,
     FrontNumberBoardRegionExtractor,
     HybridDigitOcrEngine,
     MotorcycleVisionPipeline,
@@ -50,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event", action="append", default=[])
     parser.add_argument("--frame-step", type=int, default=1)
     parser.add_argument(
+        "--window-gap",
+        type=float,
+        default=0.1,
+        help="Merge labelled diagnostic windows separated by at most this many seconds",
+    )
+    parser.add_argument(
         "--line",
         default="0.25,0.05,0.25,0.95",
         help="Normalized finish line as x1,y1,x2,y2",
@@ -73,10 +78,12 @@ def load_labels(path: Path, selected: set[str]) -> list[Label]:
     ]
 
 
-def merge_windows(labels: list[Label]) -> list[tuple[float, float, list[Label]]]:
+def merge_windows(
+    labels: list[Label], *, maximum_gap_s: float = 0.1
+) -> list[tuple[float, float, list[Label]]]:
     windows: list[tuple[float, float, list[Label]]] = []
     for label in sorted(labels, key=lambda item: (item.start_s, item.end_s)):
-        if windows and label.start_s <= windows[-1][1] + 0.1:
+        if windows and label.start_s <= windows[-1][1] + maximum_gap_s:
             start, end, members = windows[-1]
             windows[-1] = (start, max(end, label.end_s), [*members, label])
         else:
@@ -98,11 +105,6 @@ def parse_line(value: str) -> FinishLine:
 
 
 def build_pipeline(finish_line: FinishLine) -> MotorcycleVisionPipeline:
-    verifier: Florence2NumberVerifier | None = Florence2NumberVerifier()
-    if verifier.available:
-        verifier.prepare()
-    else:
-        verifier = None
     return MotorcycleVisionPipeline(
         detector=YoloXMotorcycleDetector(confidence_threshold=0.18),
         tracker=SupervisionByteTrack(
@@ -130,7 +132,7 @@ def build_pipeline(finish_line: FinishLine) -> MotorcycleVisionPipeline:
             )
         ),
         finish_line=finish_line,
-        number_verifier=verifier,
+        number_verifier=None,
     )
 
 
@@ -148,11 +150,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     report_windows: list[dict[str, Any]] = []
     started = time.perf_counter()
     try:
-        for start_s, end_s, members in merge_windows(labels):
+        for start_s, end_s, members in merge_windows(
+            labels, maximum_gap_s=max(0.0, args.window_gap)
+        ):
             pipeline.reset()
             capture.set(cv2.CAP_PROP_POS_MSEC, start_s * 1000.0)
             found: dict[str, float] = {}
+            passages: dict[str, float] = {}
             processed_frames = 0
+            full_cadence_until = 0
             source_index = max(0, round(start_s * fps))
             while True:
                 ok, image = capture.read()
@@ -170,12 +176,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     captured_at_utc=origin_utc + timedelta(seconds=position_s),
                     metadata={"evaluation_only": True, "deferred_ocr": True},
                 )
-                if source_index % max(1, args.frame_step) == 0:
+                if pipeline.track_near_finish_line((image.shape[1], image.shape[0])):
+                    full_cadence_until = max(
+                        full_cadence_until,
+                        source_index + round(fps * 0.65),
+                    )
+                if (
+                    source_index % max(1, args.frame_step) == 0
+                    or source_index <= full_cadence_until
+                ):
                     result = pipeline.process(frame)
                     for _track_id, number, _confidence in result.track_numbers:
                         found.setdefault(number, position_s)
                     for passage in result.passages:
                         found.setdefault(passage.racing_number, position_s)
+                        passages.setdefault(passage.racing_number, position_s)
                     processed_frames += 1
                 else:
                     pipeline.collect_evidence(frame)
@@ -206,6 +221,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "missed": sorted(set(expected) - set(found)),
                     "unexpected": sorted(set(found) - set(expected)),
                     "first_seen_s": found,
+                    "passages_s": passages,
                     "processed_frames": processed_frames,
                     "recovery_diagnostics": recovery_diagnostics,
                 }

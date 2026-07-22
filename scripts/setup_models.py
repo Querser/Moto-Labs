@@ -75,12 +75,12 @@ def prepare_florence(project_root: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--skip-florence", action="store_true")
+    parser.add_argument("--include-florence", action="store_true")
     args = parser.parse_args()
     project_root = Path(__file__).resolve().parents[1]
     os.chdir(project_root)
     prepare_ppocr(project_root)
-    if not args.skip_florence:
+    if args.include_florence:
         prepare_florence(project_root)
     return 0
 

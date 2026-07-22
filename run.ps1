@@ -95,29 +95,6 @@ if (-not $SkipInstall) {
     }
 }
 
-# Florence owns its CUDA 13 libraries in a second interpreter process. Separate
-# site-packages and address spaces prevent its cuDNN from shadowing ORT's copy.
-if (-not $SkipInstall -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-    $FlorencePython = Join-Path $ProjectRoot ".venv-florence\Scripts\python.exe"
-    if (-not (Test-Path -LiteralPath $FlorencePython)) {
-        & $VenvPython -m venv --system-site-packages ".venv-florence"
-    }
-    & $FlorencePython -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Installing the isolated CUDA runtime for Florence-2..."
-        & $FlorencePython -m pip install --force-reinstall --no-deps `
-            "torch==2.13.0+cu130" "torchvision==0.28.0+cu130" `
-            --index-url "https://download.pytorch.org/whl/cu130"
-    }
-    & $FlorencePython -c "import transformers, accelerate, timm, einops, cv2, PIL" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Installing Florence-2 worker dependencies..."
-        & $FlorencePython -m pip install `
-            "transformers==4.46.3" "accelerate>=1.6,<2" "timm>=1.0,<2" `
-            "einops>=0.8,<1" "opencv-contrib-python==4.10.0.84" "pillow>=10,<13"
-    }
-}
-
 # The application performs no network requests during a race.  On a clean
 # installation only, fetch the exact official detector weight and verify it
 # before the server is allowed to use it.
@@ -148,10 +125,9 @@ if ($InstalledHash -ne $DetectorSha256) {
 
 $PpOcrModel = Join-Path $ProjectRoot "models\paddlex\official_models\PP-OCRv6_medium_rec_onnx\inference.onnx"
 $PpOcrDetector = Join-Path $ProjectRoot "models\paddlex\official_models\PP-OCRv5_mobile_det_onnx\inference.onnx"
-$FlorenceModel = Join-Path $ProjectRoot "models\florence-2-base-ft\model.safetensors"
-if (-not (Test-Path -LiteralPath $PpOcrModel) -or -not (Test-Path -LiteralPath $PpOcrDetector) -or -not (Test-Path -LiteralPath $FlorenceModel)) {
+if (-not (Test-Path -LiteralPath $PpOcrModel) -or -not (Test-Path -LiteralPath $PpOcrDetector)) {
     if ($SkipInstall) {
-        throw "OCR/VLM weights are missing. Run: .\.venv\Scripts\python.exe scripts\setup_models.py"
+        throw "OCR weights are missing. Run: .\.venv\Scripts\python.exe scripts\setup_models.py"
     }
     Write-Host "Downloading the pinned local OCR models..."
     & $VenvPython scripts\setup_models.py

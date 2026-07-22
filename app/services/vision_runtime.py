@@ -18,7 +18,6 @@ from app.vision import (
     BoundingBoxNumberRegionExtractor,
     CentroidIoUTracker,
     FinishLine,
-    Florence2NumberVerifier,
     FrontNumberBoardRegionExtractor,
     HybridDigitOcrEngine,
     MetadataObjectDetector,
@@ -64,6 +63,7 @@ class VisionRuntime:
         self._stable_by_track: dict[int, str] = {}
         self._last_recognition_by_number: dict[str, int] = {}
         self._number_board_jpeg: bytes | None = None
+        self._last_frame_size = (1280, 720)
         # Retain a short 30 FPS burst. A single "latest frame" slot can skip
         # the only sharp, fully visible number while OCR is busy on its predecessor.
         self._pending_frames: deque[Frame] = deque(maxlen=6)
@@ -115,15 +115,6 @@ class VisionRuntime:
                 frame_rate=30,
             )
             region_extractor = FrontNumberBoardRegionExtractor(maximum_candidates=3)
-        number_verifier = Florence2NumberVerifier() if uploaded_video else None
-        if number_verifier is not None and not number_verifier.available:
-            number_verifier = None
-        if number_verifier is not None:
-            try:
-                number_verifier.prepare()
-            except Exception:
-                logger.exception("Florence-2 verifier unavailable; continuing without it")
-                number_verifier = None
         pipeline = MotorcycleVisionPipeline(
             detector=detector,
             tracker=tracker,
@@ -144,7 +135,10 @@ class VisionRuntime:
             ),
             finish_line=self.finish_line,
             recovery_delay_ns=0 if synthetic else 300_000_000,
-            number_verifier=number_verifier,
+            # Conventional multi-frame OCR is deterministic and bounded. The
+            # experimental autoregressive verifier was removed from production
+            # because a worker failure could stall an otherwise short video.
+            number_verifier=None,
             # Uploaded races only need expensive OCR for a real geometric
             # crossing. Recovering every short-lived tracker fragment on exit
             # made dense videos several times slower without creating laps.
@@ -167,6 +161,7 @@ class VisionRuntime:
             self._last_recognition_by_number = {}
             self._recognition_history.clear()
             self._number_board_jpeg = None
+            self._last_frame_size = (1280, 720)
             self._enabled = True
             if previous is not None:
                 previous.close()
@@ -277,6 +272,25 @@ class VisionRuntime:
             if self._enabled and self._pipeline is not None:
                 self._pipeline.collect_evidence(frame)
 
+    def track_near_finish_line(self) -> bool:
+        """Tell the offline scheduler when exact per-frame geometry is valuable."""
+
+        with self._lock:
+            return bool(
+                self._enabled
+                and self._pipeline is not None
+                and self._pipeline.track_near_finish_line(self._last_frame_size)
+            )
+
+    def begin_candidate_window_sync(self) -> None:
+        """Drop transient tracking state between separate offline passages."""
+
+        with self._lock:
+            if self._enabled and self._pipeline is not None:
+                self._pipeline.reset()
+                self._stable_by_track = {}
+                self._recognized_number = None
+
     def _processing_loop(self) -> None:
         while not self._worker_stop.is_set():
             with self._frame_condition:
@@ -300,6 +314,7 @@ class VisionRuntime:
             started_ns = time.perf_counter_ns()
             try:
                 result = self._pipeline.process(frame)
+                self._last_frame_size = (int(frame.image.shape[1]), int(frame.image.shape[0]))
                 self._recognized_number = result.recognized_number
                 numbers = {
                     track_id: (number, confidence)

@@ -34,8 +34,7 @@ fi
 
 PPOCR_MODEL="$PROJECT_ROOT/models/paddlex/official_models/PP-OCRv6_medium_rec_onnx/inference.onnx"
 PPOCR_DETECTOR="$PROJECT_ROOT/models/paddlex/official_models/PP-OCRv5_mobile_det_onnx/inference.onnx"
-FLORENCE_MODEL="$PROJECT_ROOT/models/florence-2-base-ft/model.safetensors"
-if [ ! -f "$PPOCR_MODEL" ] || [ ! -f "$PPOCR_DETECTOR" ] || [ ! -f "$FLORENCE_MODEL" ]; then
+if [ ! -f "$PPOCR_MODEL" ] || [ ! -f "$PPOCR_DETECTOR" ]; then
     echo "Downloading the pinned local OCR models..."
     "$VENV_PYTHON" scripts/setup_models.py
 fi

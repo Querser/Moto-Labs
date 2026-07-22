@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from threading import Condition, RLock, Thread, current_thread
@@ -37,13 +38,18 @@ class UploadedVideoRuntime:
         self._processed_frames = 0
         self._scan_processed_frames = 0
         self._analyzed_frames = 0
+        self._evidence_frames = 0
         self._analysis_frame_step = 1
         self._active_analysis_frame_step = 1
         self._motion_hold_until_sequence = 0
         self._motion_detector: OpenCVMotionDetector | None = None
         self._phase = "idle"
         self._candidate_windows: list[tuple[int, int]] = []
+        self._candidate_window_index = 0
+        self._active_candidate_window_index: int | None = None
         self._scan_frame_step = 1
+        self._phase_started_at = 0.0
+        self._processing_started_at = 0.0
         self._latest_frame: Frame | None = None
         self._latest_jpeg: bytes | None = None
         self._last_error: str | None = None
@@ -57,6 +63,7 @@ class UploadedVideoRuntime:
         start_position_ns: int = 0,
         defer_processing: bool = False,
     ) -> None:
+        self._processing_started_at = time.perf_counter()
         catalog = VideoCatalog(get_settings())
         video = catalog.get(video_id)
         self.stop(stop_vision=False)
@@ -93,11 +100,15 @@ class UploadedVideoRuntime:
             )
             self._scan_processed_frames = 0
             self._analyzed_frames = 0
+            self._evidence_frames = 0
             # Idle video is sampled sparsely. Motion immediately opens a full-
             # cadence burst so every motorcycle keeps source-frame timing near
             # the line, including two riders separated by only a few frames.
-            self._analysis_frame_step = max(1, round(video.fps / 6.0))
-            self._active_analysis_frame_step = max(1, round(video.fps / 30.0))
+            # YOLOX-Tiny sustains source cadence on the supported accelerated
+            # runtime. Every candidate frame proved materially more reliable
+            # for tiny fast boards; empty parts are still skipped entirely.
+            self._analysis_frame_step = max(1, round(video.fps / 30.0))
+            self._active_analysis_frame_step = self._analysis_frame_step
             self._motion_hold_until_sequence = 0
             self._motion_detector = OpenCVMotionDetector(
                 minimum_area=700,
@@ -106,7 +117,10 @@ class UploadedVideoRuntime:
             )
             self._phase = "scanning"
             self._candidate_windows = []
+            self._candidate_window_index = 0
+            self._active_candidate_window_index = None
             self._scan_frame_step = max(1, round(video.fps / 3.0))
+            self._phase_started_at = time.perf_counter()
             self._latest_frame = None
             self._latest_jpeg = None
             self._last_error = None
@@ -202,6 +216,7 @@ class UploadedVideoRuntime:
                 "processed_frames": self._processed_frames,
                 "scan_processed_frames": self._scan_processed_frames,
                 "analyzed_frames": self._analyzed_frames,
+                "evidence_frames": self._evidence_frames,
                 "analysis_frame_step": self._analysis_frame_step,
                 "total_frames": video.frame_count if video else 0,
                 "progress": (
@@ -250,10 +265,8 @@ class UploadedVideoRuntime:
                         self._processed_frames += 1
                         self._last_error = None
                     continue
-                # Pass one already reduced the file to short motorcycle
-                # windows. Preserve every source frame inside those windows so
-                # two riders and the interpolated line timestamp retain the
-                # original camera cadence.
+                # YOLO + ByteTrack preserve source cadence only inside the
+                # compact motorcycle windows found by pass one.
                 frame = replace(
                     frame,
                     metadata={
@@ -262,14 +275,33 @@ class UploadedVideoRuntime:
                         "motorcycle_window": True,
                     },
                 )
-                vision_runtime.process_frame_sync(frame)
-                jpeg = _encode_jpeg(frame)
+                near_line = bool(
+                    getattr(vision_runtime, "track_near_finish_line", lambda: False)()
+                )
+                if near_line:
+                    fps = max(1.0, float(frame.metadata.get("source_fps", 30.0)))
+                    self._motion_hold_until_sequence = max(
+                        self._motion_hold_until_sequence,
+                        frame.sequence + round(fps * 0.65),
+                    )
+                semantic_frame = (
+                    frame.sequence % self._analysis_frame_step == 0
+                    or frame.sequence <= self._motion_hold_until_sequence
+                )
+                if semantic_frame:
+                    vision_runtime.process_frame_sync(frame)
+                else:
+                    vision_runtime.collect_evidence_frame_sync(frame)
+                jpeg = _encode_jpeg(frame) if frame.sequence % 3 == 0 else None
                 with self._lock:
                     self._latest_frame = frame
                     if jpeg is not None:
                         self._latest_jpeg = jpeg
                     self._processed_frames += 1
-                    self._analyzed_frames += 1
+                    if semantic_frame:
+                        self._analyzed_frames += 1
+                    else:
+                        self._evidence_frames += 1
                     self._last_error = None
             except EndOfStream:
                 if self._phase == "scanning":
@@ -278,6 +310,11 @@ class UploadedVideoRuntime:
                         continue
                 with self._lock:
                     self._state = "completed"
+                logger.info(
+                    "Uploaded-video processing completed in %.2fs: %d semantic frames",
+                    time.perf_counter() - self._processing_started_at,
+                    self._analyzed_frames,
+                )
                 return
             except Exception as exc:
                 logger.exception("Uploaded video processing failed")
@@ -302,6 +339,7 @@ class UploadedVideoRuntime:
             ),
         )
         self._analyzed_frames = 0
+        self._evidence_frames = 0
         self._scan_processed_frames = 0
         self._latest_frame = None
         self._latest_jpeg = None
@@ -313,22 +351,34 @@ class UploadedVideoRuntime:
         )
         self._phase = "scanning"
         self._candidate_windows = []
+        self._candidate_window_index = 0
+        self._active_candidate_window_index = None
+        self._phase_started_at = time.perf_counter()
         vision_runtime.configure_source(source.identifier, race_id=self._race_id)
 
     def _scan_frame(self, frame: Frame) -> None:
         """Find broad passage windows without running tracking or OCR."""
 
-        motion = bool(self._motion_detector.detect(frame)) if self._motion_detector else True
         fps = max(1.0, float(frame.metadata.get("source_fps", 30.0)))
         sampled = frame.sequence % self._scan_frame_step == 0
         periodic_full_scan = frame.sequence % max(1, round(fps)) == 0
+        # Background subtraction was the dominant cost of pass one because it
+        # resized and updated a 4112-frame history even though YOLO sampled only
+        # three frames per second. Update it on those same samples; a periodic
+        # full-frame YOLO pass still protects against missed/temporarily still
+        # motorcycles.
+        motion = (
+            bool(self._motion_detector.detect(frame))
+            if sampled and self._motion_detector
+            else False
+        )
         should_detect = sampled and (motion or periodic_full_scan)
         detected = vision_runtime.scan_frame_sync(frame) if should_detect else False
         if detected:
             self._add_candidate_window(
-                max(0, frame.sequence - round(fps * 1.5)),
-                frame.sequence + round(fps * 2.5),
-                merge_gap=round(fps * 0.75),
+                max(0, frame.sequence - round(fps * 1.0)),
+                frame.sequence + round(fps * 1.4),
+                merge_gap=round(fps * 0.35),
             )
         jpeg = _encode_jpeg(frame) if should_detect else None
         with self._lock:
@@ -346,11 +396,33 @@ class UploadedVideoRuntime:
         self._candidate_windows.append((start, end))
 
     def _inside_candidate_window(self, sequence: int) -> bool:
-        return any(start <= sequence <= end for start, end in self._candidate_windows)
+        while self._candidate_window_index < len(self._candidate_windows):
+            start, end = self._candidate_windows[self._candidate_window_index]
+            if sequence < start:
+                return False
+            if sequence <= end:
+                if self._active_candidate_window_index != self._candidate_window_index:
+                    # The decoder skipped the empty interval, so ByteTrack did
+                    # not receive empty detections that would age the previous
+                    # physical passage out. Clear transient CV state only;
+                    # persisted race timing and lap rows remain untouched.
+                    vision_runtime.begin_candidate_window_sync()
+                    self._active_candidate_window_index = self._candidate_window_index
+                return True
+            self._candidate_window_index += 1
+        return False
 
     def _begin_analysis_pass(self, source: VideoFileSource) -> None:
         """Rewind once and run the exact pipeline only inside detected windows."""
 
+        scan_elapsed = time.perf_counter() - self._phase_started_at
+        covered_frames = sum(end - start + 1 for start, end in self._candidate_windows)
+        logger.info(
+            "Uploaded-video scan completed in %.2fs: %d windows, %d candidate frames",
+            scan_elapsed,
+            len(self._candidate_windows),
+            covered_frames,
+        )
         source.close()
         source.open()
         with self._lock:
@@ -364,6 +436,9 @@ class UploadedVideoRuntime:
                 ),
             )
             self._analyzed_frames = 0
+            self._evidence_frames = 0
+            self._candidate_window_index = 0
+            self._active_candidate_window_index = None
             self._latest_frame = None
             self._latest_jpeg = None
             self._motion_hold_until_sequence = 0
@@ -372,6 +447,7 @@ class UploadedVideoRuntime:
                 history=180,
                 variance_threshold=24.0,
             )
+            self._phase_started_at = time.perf_counter()
 
     def _progress(self, total_frames: int) -> float:
         if total_frames <= 0:

@@ -160,6 +160,56 @@ def test_bytetrack_continuity_through_short_detection_gap() -> None:
     assert len(returned[0].trajectory) == 2
 
 
+def test_pipeline_stitches_one_unambiguous_short_tracker_split() -> None:
+    class SplitTracker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def update(self, detections, *, captured_monotonic_ns):  # type: ignore[no-untyped-def]
+            del detections
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    tracked(
+                        1,
+                        (50, 20, 90, 70),
+                        [(70, 45, captured_monotonic_ns)],
+                    )
+                ]
+            return [
+                tracked(
+                    5,
+                    (34, 20, 74, 70),
+                    [(54, 45, captured_monotonic_ns)],
+                )
+            ]
+
+        def reset(self) -> None:
+            self.calls = 0
+
+    class EmptyOcr:
+        def recognize(self, region, *, frame, track):  # type: ignore[no-untyped-def]
+            del region, frame, track
+            return []
+
+        def close(self) -> None:
+            return None
+
+    pipeline = MotorcycleVisionPipeline(
+        detector=MetadataObjectDetector(),
+        tracker=SplitTracker(),  # type: ignore[arg-type]
+        region_extractor=BoundingBoxNumberRegionExtractor(),
+        ocr_engine=EmptyOcr(),  # type: ignore[arg-type]
+        ocr_aggregator=OcrAggregator(),
+        finish_line=FinishLine(0.1, 0.9, 0.9, 0.9),
+    )
+    first = pipeline.process(camera_frame(1, []))
+    second = pipeline.process(camera_frame(2, []))
+    assert [item.track_id for item in first.tracks] == [1]
+    assert [item.track_id for item in second.tracks] == [1]
+    assert second.tracks[0].hits == 2
+
+
 def test_ocr_consensus_prefers_three_supporting_frames_and_preserves_zeroes() -> None:
     aggregator = OcrAggregator(
         OcrAggregationConfig(
@@ -587,6 +637,46 @@ def test_crossing_recovery_prefers_complete_three_digits_over_truncated_prefix()
     pipeline.process(camera_frame(1, [plain], image=sharp))
     result = pipeline.process(camera_frame(2, [crossed], image=sharp))
     assert [item.racing_number for item in result.passages] == ["222"]
+
+
+def test_recovery_stitches_ordered_partial_readings_without_roster() -> None:
+    class PartialOcr:
+        def recognize(self, region, *, frame, track):  # type: ignore[no-untyped-def]
+            del region, track
+            return [
+                OcrPrediction(
+                    "43" if frame.sequence == 1 else "35",
+                    0.96,
+                    metadata={"engine": "test_partial"},
+                )
+            ]
+
+        def close(self) -> None:
+            return None
+
+    pipeline = MotorcycleVisionPipeline(
+        detector=MetadataObjectDetector(),
+        tracker=CentroidIoUTracker(maximum_centroid_distance=100),
+        region_extractor=BoundingBoxNumberRegionExtractor(),
+        ocr_engine=PartialOcr(),  # type: ignore[arg-type]
+        ocr_aggregator=OcrAggregator(),
+        finish_line=FinishLine(0.1, 0.9, 0.9, 0.9),
+    )
+    detection = {"bbox": (20, 10, 60, 50), "confidence": 0.99, "label": "motorcycle"}
+    for sequence in (1, 2):
+        source = camera_frame(sequence, [detection])
+        pipeline.process(
+            Frame(
+                image=source.image,
+                sequence=source.sequence,
+                source_id=source.source_id,
+                captured_monotonic_ns=source.captured_monotonic_ns,
+                captured_at_utc=source.captured_at_utc,
+                metadata={**source.metadata, "deferred_ocr": True},
+            )
+        )
+    recovered = pipeline.recover_pending_identities()
+    assert [item[1] for item in recovered] == ["435"]
 
 
 def test_two_motorcycles_cross_close_together_independently() -> None:

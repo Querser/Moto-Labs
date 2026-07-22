@@ -162,6 +162,7 @@ def test_uploaded_runtime_scans_then_processes_candidate_window(
             self.frames: list[Any] = []
             self.analyzed: list[int] = []
             self.evidence_only: list[int] = []
+            self.window_resets = 0
 
         def configure_source(self, source_identifier: str, *, race_id: int | None) -> None:
             assert source_identifier == uploaded.identifier
@@ -177,6 +178,9 @@ def test_uploaded_runtime_scans_then_processes_candidate_window(
         def collect_evidence_frame_sync(self, frame: Any) -> None:
             self.frames.append(frame)
             self.evidence_only.append(frame.sequence)
+
+        def begin_candidate_window_sync(self) -> None:
+            self.window_resets += 1
 
         def status(self) -> dict[str, Any]:
             return {
@@ -212,10 +216,13 @@ def test_uploaded_runtime_scans_then_processes_candidate_window(
     assert status["processed_frames"] == 5
     assert len(fake.frames) == 5
     assert [frame.sequence for frame in fake.frames] == [0, 1, 2, 3, 4]
-    # Pass one only locates a broad window. Pass two preserves every source
-    # frame inside that window for exact tracking and timestamp interpolation.
+    # Pass one only locates a broad window. Inside a candidate passage, pass
+    # two preserves every source frame for fast-board geometry and OCR.
     assert fake.analyzed == [0, 1, 2, 3, 4]
     assert fake.evidence_only == []
+    assert status["analyzed_frames"] == 5
+    assert status["evidence_frames"] == 0
+    assert fake.window_resets == 1
     runtime.restart()
     deadline = time.monotonic() + 5
     while runtime.status()["state"] not in {"completed", "error"} and time.monotonic() < deadline:
@@ -225,3 +232,4 @@ def test_uploaded_runtime_scans_then_processes_candidate_window(
     assert len(fake.frames) == 10
     assert fake.analyzed == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
     assert fake.evidence_only == []
+    assert fake.window_resets == 2
