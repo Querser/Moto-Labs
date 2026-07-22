@@ -1,0 +1,24 @@
+event_id,start_s,end_s,expected_number,readable,notes
+001,1.5,3.8,123,true,front board
+002,17.0,19.1,99,true,front board
+003a,25.8,28.8,17,true,first of two motorcycles
+003b,25.8,28.8,113,true,second of two motorcycles
+004,39.0,41.3,410,true,front board; rear 313 must be ignored
+005,47.2,49.2,004,true,leading zeroes are authoritative
+006a,49.0,51.5,012,true,motorcycle leaving frame
+006b,49.0,52.0,15,true,right motorcycle; left motorcycle has no number
+007a,54.8,57.0,47,true,group passage
+007b,54.8,57.2,707,true,group passage
+008a,56.3,58.2,190,true,group passage
+008b,56.3,58.2,88,true,group passage
+009,77.5,79.7,257,true,front board
+010,81.2,83.0,222,true,front board
+011,82.7,84.2,,false,no racing number
+012,84.0,86.3,810,true,front board
+013,111.0,113.0,044,true,leading zeroes are authoritative
+014,112.2,114.2,777,true,front board
+015,117.3,119.0,,false,number unreadable in source
+016,118.3,120.6,435,true,front board
+017,127.2,129.4,,false,number unreadable in source
+018,129.2,131.7,72,true,first motorcycle; second board is occluded
+019,131.0,136.0,,false,last 81 is unreadable in source

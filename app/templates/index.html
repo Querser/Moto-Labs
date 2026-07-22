@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Moto Laps — счётчик кругов</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem("motoLaps.theme") || "dark";</script>
+  <link rel="stylesheet" href="/static/css/app.css?v=0.8.0">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">ML</span><div class="brand-copy"><strong>Moto Laps</strong><span>контроль круга с камеры</span></div></div>
+    <nav aria-label="Разделы">
+      <button class="nav active" data-view="setup">Настройка гонки</button>
+      <button class="nav" data-view="active">Активная гонка</button>
+      <button class="nav" data-view="results">Результаты</button>
+      <button class="nav" data-view="camera">Камера</button>
+      <button class="nav" data-view="video">Видео</button>
+    </nav>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Переключить тему">Светлая тема</button>
+    <button id="shutdown-app" class="shutdown-app" type="button">Завершить работу</button>
+    <span id="server-state" class="pill">Подключение…</span>
+  </header>
+
+  <main>
+    <div id="message" class="message" role="status" hidden></div>
+
+    <section id="view-setup" class="view active">
+      <div class="heading"><h1>Настройка гонки</h1><p>Выберите камеру, укажите параметры гонки и нажмите «Старт».</p></div>
+      <div class="layout">
+        <form id="race-form" class="card form-card">
+          <label>Название гонки *<input id="race-name" required maxlength="200" placeholder="Например, финальный заезд"></label>
+          <label>Описание (необязательно)<textarea id="race-description" maxlength="2000" rows="3" placeholder="Краткая заметка о заезде"></textarea></label>
+          <label>Количество кругов *<input id="required-laps" type="number" min="1" max="10000" value="3" required></label>
+          <label>Источник *<select id="source-mode"><option value="camera">Встроенная / USB-камера</option><option value="video">Загруженное видео</option></select></label>
+          <div id="setup-camera-fields">
+            <label>Камера *<select id="setup-camera"><option value="">Поиск камер…</option></select></label>
+            <button id="refresh-cameras" type="button">Обновить список камер</button>
+          </div>
+          <div id="setup-video-fields" hidden>
+            <label>Видео *<select id="setup-video"><option value="">Сначала загрузите видео</option></select></label>
+            <p class="hint">Загрузка и проверка файла находятся в разделе «Видео».</p>
+          </div>
+          <button class="primary" type="submit">Старт гонки</button>
+        </form>
+        <div class="card">
+          <h2>Предпросмотр</h2>
+          <div class="video"><img id="setup-preview" alt="Предпросмотр выбранной камеры"><svg class="vision-overlay" aria-hidden="true"><line class="finish-line"></line><g class="detection-layer"></g></svg><p class="video-empty">Выберите камеру</p></div>
+          <p class="hint">Камера может быть установлена на высоте около 2 м и наклонена на 45–60°. Настройте красную линию в разделе «Камера» так, чтобы она совпала с физической чертой финиша.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-active" class="view">
+      <div class="heading"><h1 id="active-name">Активная гонка</h1><p>Круг фиксируется, когда ведущая точка распознанного мотоцикла пересекает финишную линию.</p></div>
+      <div class="race-bar card">
+        <div><span>Статус</span><strong id="race-status">—</strong></div>
+        <div><span>Время гонки</span><strong id="race-time" class="race-clock">00:00.000</strong><small class="time-format">мин : сек . мс</small></div>
+        <div><span>Распознан номер</span><strong id="recognized-number">—</strong></div>
+        <div><span>Запись камеры</span><strong id="recording-state">—</strong></div>
+        <div class="controls"><button id="pause-race">Пауза</button><button id="resume-race">Продолжить</button><button id="finish-race" class="danger">Завершить</button></div>
+      </div>
+      <div class="layout active-layout">
+        <div class="card"><div class="video"><img id="active-preview" alt="Видео финишной линии"><video id="active-video-player" muted playsinline preload="metadata" hidden></video><svg class="vision-overlay" aria-hidden="true"><line class="finish-line"></line><g class="detection-layer"></g></svg><p class="video-empty">Камера не запущена</p></div></div>
+        <div class="card">
+          <h2>Последние круги</h2>
+          <div class="table-wrap"><table><thead><tr><th>Номер</th><th>Круг</th><th>Время круга</th></tr></thead><tbody id="recent-laps"></tbody></table></div>
+          <p id="recent-empty" class="empty">Кругов пока нет.</p>
+        </div>
+      </div>
+      <div id="recognition-panel" class="card recognition-panel">
+        <div><span>Последнее стабильное распознавание</span><strong id="stable-number">—</strong><small id="stable-state">Ожидание мотоцикла</small></div>
+        <ol id="recognition-history" class="recognition-history"></ol>
+      </div>
+    </section>
+
+    <section id="view-results" class="view">
+      <div class="heading"><h1>Результаты гонок</h1><p>Каждая гонка хранится отдельно со своими номерами, кругами и временем.</p></div>
+      <div class="card filters"><label>Сортировка кругов<select id="sort-laps"><option value="recorded">По времени записи</option><option value="number">По номеру</option><option value="lap">По кругу</option></select></label></div>
+      <p id="results-empty" class="card empty">Сохранённых гонок пока нет.</p>
+      <div id="race-results" class="race-results"></div>
+    </section>
+
+    <section id="view-camera" class="view">
+      <div class="heading"><h1>Камера и финишная линия</h1><p>Выбранная камера и одна текущая линия сохраняются после перезапуска.</p></div>
+      <div class="layout">
+        <div class="card form-card">
+          <label>Встроенная или USB-камера<select id="camera-select"></select></label>
+          <button id="apply-camera" class="primary">Применить камеру</button>
+          <div class="zone-actions"><button id="save-line" class="primary">Сохранить линию</button><button id="reset-line">Сбросить линию</button></div>
+          <p class="hint">Перетащите любой круглый конец независимо или возьмитесь за любой участок красного отрезка, чтобы переместить линию целиком. После отпускания линия сохраняется автоматически.</p>
+          <p class="hint">Распознавание и запись кругов включаются после старта гонки.</p>
+          <details class="debug-crop"><summary>Проверить выделение номера</summary><img id="number-board-preview" alt="Последняя область номерной таблички"><p class="hint">Это только проверка кадрирования; настроек модели здесь нет.</p></details>
+        </div>
+        <div class="card"><div class="video"><img id="camera-preview" alt="Предпросмотр камеры"><svg id="editable-line" class="vision-overlay editable" aria-label="Финишная линия"><line class="finish-line"></line><circle class="line-handle" data-endpoint="start" r="9"></circle><circle class="line-handle" data-endpoint="end" r="9"></circle><g class="detection-layer"></g></svg><p class="video-empty">Камера не выбрана</p></div></div>
+      </div>
+    </section>
+
+    <section id="view-video" class="view">
+      <div class="heading"><h1>Загрузка и обработка видео</h1><p>MP4, MOV, AVI или MKV обрабатываются тем же детектором, трекером, OCR и модулем пересечения линии, что и живая камера.</p></div>
+      <div class="layout">
+        <div class="card form-card">
+          <label>Файл видео<input id="video-file" type="file" accept=".mp4,.mov,.avi,.mkv,video/*"></label>
+          <button id="upload-video" class="primary" type="button">Загрузить и проверить</button>
+          <label>Загруженное видео<select id="video-select"><option value="">Видео пока не загружены</option></select></label>
+          <div class="zone-actions"><button id="restart-video" type="button">С начала</button><button id="video-save-line" class="primary" type="button">Сохранить линию</button></div>
+          <p id="video-progress" class="hint">Выберите видео. Затем создайте гонку с источником «Загруженное видео» и запустите её.</p>
+          <p class="hint">Перетащите любой конец линии отдельно или сам отрезок целиком. Координаты общие для камеры и видео и сохраняются в SQLite.</p>
+        </div>
+        <div class="card">
+          <div class="video"><img id="video-preview" alt="Предпросмотр загруженного видео"><video id="video-player" muted playsinline preload="metadata" hidden></video><svg id="video-editable-line" class="vision-overlay editable" aria-label="Финишная линия видео"><line class="finish-line"></line><circle class="line-handle" data-endpoint="start" r="9"></circle><circle class="line-handle" data-endpoint="end" r="9"></circle><g class="detection-layer"></g></svg><p class="video-empty">Видео не выбрано</p></div>
+        </div>
+      </div>
+      <div class="card recognition-panel">
+        <div><span>Стабильный номер</span><strong id="video-stable-number">—</strong><small id="video-stable-state">Ожидание обработки</small></div>
+        <ol id="video-recognition-history" class="recognition-history"></ol>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="correction-dialog">
+    <form id="correction-form" method="dialog">
+      <h2>Исправить круг</h2>
+      <input id="correction-race-id" type="hidden"><input id="correction-id" type="hidden">
+      <label>Номер мотоцикла<input id="correction-number" inputmode="numeric" pattern="[0-9]+" required maxlength="16"></label>
+      <label>Номер круга<input id="correction-lap" type="number" min="1" required></label>
+      <div class="dialog-actions"><button value="cancel">Отмена</button><button id="delete-lap" type="button" class="danger">Удалить запись</button><button type="submit" class="primary" value="save">Сохранить</button></div>
+    </form>
+  </dialog>
+
+  <script src="/static/js/lap_state.js?v=0.4.0" defer></script>
+  <script src="/static/js/finish_line_editor.js?v=0.5.0" defer></script>
+  <script src="/static/js/recognition_view.js?v=0.5.0" defer></script>
+  <script src="/static/js/race_clock.js?v=0.5.1" defer></script>
+  <script src="/static/js/video_playback.js?v=0.8.0" defer></script>
+  <script src="/static/js/app.js?v=0.8.0" defer></script>
+</body>
+</html>

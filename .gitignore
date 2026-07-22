@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.Python
+
+# Virtual environments
+.venv/
+.venv-florence/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.local
+
+# Runtime data. Keep only the small, user-authored timing labels used by the
+# reproducible evaluator; videos, databases, logs and generated reports stay local.
+data/*
+!data/reference/
+data/reference/*
+!data/reference/video_2026-07-19_13-50-08/
+data/reference/video_2026-07-19_13-50-08/*
+!data/reference/video_2026-07-19_13-50-08/ground_truth.csv
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+logs/
+
+# Test and quality caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated exports and media
+*.xlsx
+*.avi
+*.mp4
+*.mov
+*.mkv
+models/*.onnx
+models/*.ort
+models/
+artifacts/
